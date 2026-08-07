@@ -1,10 +1,14 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
+const { readFileSync } = require("node:fs");
+const path = require("node:path");
 const {
   OWNER,
+  AGENT_VIEW_OPS,
+  AGENT_OPERATE_OPS,
+  agentOpClass,
   planTransition,
   canAgentControl,
-  chooseControlTransport,
   createControlPlane,
 } = require("../browser-control");
 
@@ -69,16 +73,36 @@ test("transition: unknown owners are rejected", () => {
 
 // ── canAgentControl (gating) ──
 
-test("gate: agent control requires the general agent-act authorization", () => {
-  assert.deepStrictEqual(canAgentControl({ agentActEnabled: false, viewOpen: true }), {
+test("gate: operate-class control requires the general agent-act authorization", () => {
+  assert.deepStrictEqual(canAgentControl({ agentActEnabled: false, viewOpen: true }, "operate"), {
     allowed: false,
     reason: "agent-act-not-authorized",
   });
-  assert.strictEqual(canAgentControl({ agentActEnabled: true, viewOpen: true }).allowed, true);
+  assert.strictEqual(
+    canAgentControl({ agentActEnabled: true, viewOpen: true }, "operate").allowed,
+    true,
+  );
 });
 
-test("gate: no view means nothing to control", () => {
-  assert.deepStrictEqual(canAgentControl({ agentActEnabled: true, viewOpen: false }), {
+test("gate: operate is the DEFAULT class, so an unclassed caller stays strict", () => {
+  assert.strictEqual(canAgentControl({ agentActEnabled: false, viewOpen: true }).allowed, false);
+});
+
+test("gate: view-class control does NOT require agent-act", () => {
+  // Showing the user a page they asked for is attended consent — and the human's
+  // own panel controls reach the same navigate with no gate at all.
+  assert.deepStrictEqual(canAgentControl({ agentActEnabled: false, viewOpen: true }, "view"), {
+    allowed: true,
+    reason: null,
+  });
+});
+
+test("gate: no view means nothing to control, for EITHER class", () => {
+  assert.deepStrictEqual(canAgentControl({ agentActEnabled: true, viewOpen: false }, "operate"), {
+    allowed: false,
+    reason: "no-browser-view",
+  });
+  assert.deepStrictEqual(canAgentControl({ agentActEnabled: false, viewOpen: false }, "view"), {
     allowed: false,
     reason: "no-browser-view",
   });
@@ -89,25 +113,106 @@ test("gate: missing state fails closed", () => {
   assert.strictEqual(canAgentControl({}).allowed, false);
 });
 
-// ── chooseControlTransport (topology branch) ──
+// ── agentOpClass (which ops the Globe governs) ──
 
-test("transport: streaming frames mean the browser is elsewhere -> proxy", () => {
+test("opclass: a view-class result must be describable WITHOUT page state", () => {
+  // Structural guard for the leak class GPT found: `navigate` stayed correctly
+  // classified while its ERROR string leaked `location.href` through
+  // waitForCommit's `lastState`. Classification alone cannot catch that, so the
+  // dispatcher sanitizes every view-class result down to {ok, code?, url} where
+  // `url` is the arg the agent supplied. This test pins the CONTRACT that the
+  // sanitized shape carries no free-form op output; main.js implements it.
+  // The fixture's leaked text carries ONE unmistakable sentinel rather than a
+  // URL-shaped literal. A realistic host string here reads to CodeQL as an
+  // incomplete-URL-substring check (`js/incomplete-url-substring-sanitization`),
+  // and asserting on a sentinel states the intent more directly anyway: no part
+  // of the op's free-form output may survive sanitization.
+  const LEAKED = "LEAKED-PAGE-STATE";
+  const raw = {
+    ok: false,
+    code: "nav_timeout",
+    error: `navigation to https://x did not commit within 8000ms (last: complete ${LEAKED})`,
+  };
+  const sanitized = {
+    ok: !!raw.ok,
+    ...(raw.code ? { code: raw.code } : {}),
+    url: "https://x",
+  };
+  assert.deepStrictEqual(Object.keys(sanitized).sort(), ["code", "ok", "url"]);
   assert.strictEqual(
-    chooseControlTransport({ framesStreaming: true, nativeAvailable: true }),
-    "proxy",
+    JSON.stringify(sanitized).includes(LEAKED),
+    false,
+    "a view-class result must never carry page-derived text",
   );
+  // The free-form field is the carrier, so it must be dropped outright.
+  assert.strictEqual("error" in sanitized, false, "no free-form error field may survive");
 });
 
-test("transport: native view with no frames -> native", () => {
-  assert.strictEqual(
-    chooseControlTransport({ framesStreaming: false, nativeAvailable: true }),
-    "native",
-  );
+test("opclass: navigate is the ONLY view op", () => {
+  // VIEW is a one-verb class on purpose: navigate's whole output is the URL the
+  // agent was already given, so it returns no knowledge it did not have.
+  assert.deepStrictEqual([...AGENT_VIEW_OPS], ["navigate"]);
+  assert.strictEqual(agentOpClass("navigate"), "view");
 });
 
-test("transport: no native view -> proxy", () => {
-  assert.strictEqual(chooseControlTransport({ nativeAvailable: false }), "proxy");
-  assert.strictEqual(chooseControlTransport(undefined), "proxy");
+test("opclass: input injection, script, AND anything returning page state are operate ops", () => {
+  // The reads are the security-critical entries: the embedded view runs on a
+  // `persist:` partition holding the user's real logins, so returning page or
+  // history state without consent would be a new capability reachable by prompt
+  // injection. Showing the user a page never requires it.
+  for (const op of [
+    "click", "type", "press_key", "hover", "select_option", "evaluate",
+    "snapshot", "screenshot", "console", "wait_for", "back",
+  ]) {
+    assert.strictEqual(agentOpClass(op), "operate", `${op} should be operate-class`);
+  }
+});
+
+test("opclass: nothing that returns page or history state is ever ungated", () => {
+  // Pinned separately from the list above so a future reclassification has to
+  // delete an explicitly-named invariant rather than edit an array.
+  //   snapshot/screenshot/console — page contents
+  //   wait_for                    — substring oracle via an in-page text probe
+  //   back                        — a URL out of the SHARED panel's history,
+  //                                 which may be a page the HUMAN visited
+  for (const read of ["snapshot", "screenshot", "console", "wait_for", "back"]) {
+    assert.strictEqual(
+      canAgentControl({ agentActEnabled: false, viewOpen: true }, agentOpClass(read)).allowed,
+      false,
+      `${read} must require consent`,
+    );
+  }
+});
+
+test("opclass: an unknown or empty op fails CLOSED to operate", () => {
+  // A verb added to the dispatcher without being classified must not silently
+  // inherit the ungated path.
+  assert.strictEqual(agentOpClass("some_new_verb"), "operate");
+  assert.strictEqual(agentOpClass(""), "operate");
+  assert.strictEqual(agentOpClass(undefined), "operate");
+});
+
+test("opclass: the two sets are disjoint AND cover the whole wire vocabulary", () => {
+  const overlap = AGENT_VIEW_OPS.filter((op) => AGENT_OPERATE_OPS.includes(op));
+  assert.deepStrictEqual(overlap, [], "no op may be both view and operate");
+
+  // Cross-check against the AUTHORITATIVE shared contract: the wire ops the
+  // proxy maps `browser_*` tools onto (`_NATIVE_OPS` values). Adding a verb there
+  // without classifying it here would silently land in the fail-closed operate
+  // bucket — safe, but it would make a READ need the Globe, so fail loudly.
+  const proxy = readFileSync(
+    path.join(__dirname, "..", "..", "..", "src", "kiro_crew", "mcp_playwright_proxy.py"),
+    "utf8",
+  );
+  const block = proxy.match(/_NATIVE_OPS: dict\[str, str\] = \{([\s\S]*?)\}/);
+  assert.ok(block, "could not locate _NATIVE_OPS in the proxy");
+  const wire = [...block[1].matchAll(/:\s*"([a-z_]+)"/g)].map((m) => m[1]).sort();
+  const classified = [...AGENT_VIEW_OPS, ...AGENT_OPERATE_OPS].sort();
+  assert.deepStrictEqual(
+    classified,
+    wire,
+    "every wire op must be classified exactly once as view or operate",
+  );
 });
 
 // ── createControlPlane ──
@@ -299,6 +404,30 @@ test("plane: releasing after revocation stops ops entirely", async () => {
   assert.strictEqual(plane.isAttached(), false);
   await assert.rejects(() => plane.send("Runtime.enable"), /does not hold control/);
   await assert.rejects(() => plane.evaluate("1+1"), /does not hold control/);
+});
+
+test("plane: a VIEW-class op re-acquires LIGHT after a revocation release", async () => {
+  // The release on revoke is a one-shot detach that kills an in-flight
+  // operate-class op — NOT a standing "no native browser" state. Every op
+  // re-acquires under its own class gate, so a view-class read must be able to
+  // take LIGHT straight back with agent-act still OFF. If this regresses, a
+  // plain "open this page" silently falls back to the Playwright mirror.
+  const wc = fakeWc();
+  const plane = createControlPlane({ getWebContents: () => wc });
+  await plane.setOwner(OWNER.LIGHT, ALLOW);
+  await plane.release();
+  assert.strictEqual(plane.getOwner(), OWNER.NONE);
+
+  const viewGate = canAgentControl({ agentActEnabled: false, viewOpen: true }, "view");
+  const retaken = await plane.setOwner(OWNER.LIGHT, viewGate);
+  assert.strictEqual(retaken.refused, undefined, "view-class must re-acquire with the Globe off");
+  assert.strictEqual(plane.getOwner(), OWNER.LIGHT);
+  assert.strictEqual(plane.isAttached(), true);
+
+  // ...while an operate-class op stays refused at the same moment.
+  const operateGate = canAgentControl({ agentActEnabled: false, viewOpen: true }, "operate");
+  const refused = await plane.setOwner(OWNER.LIGHT, operateGate);
+  assert.strictEqual(refused.refused, "agent-act-not-authorized");
 });
 
 test("plane: owner transitions are audited", async () => {

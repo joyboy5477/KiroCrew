@@ -116,7 +116,7 @@ import SubagentProgressBar from './chat/SubagentProgressBar'
 import TaskProgressBar from './chat/TaskProgressBar'
 import SidePanel, { CHAT_PANE_MIN_W, sidePanelFillWidth } from './chat/SidePanel'
 import { groupDisplayItems, applyRunningState } from './chat/groupDisplayItems'
-import { setSessionPreviewPending, normalizeUrl, PREVIEW_FOCUS_EVENT, PREVIEW_SNIP_EVENT, PREVIEW_ENABLE_BROWSE_EVENT, BROWSE_MODE_EVENT } from '../components/WebPreviewPanel'
+import { setSessionPreviewPending, normalizeUrl, PREVIEW_FOCUS_EVENT, PREVIEW_SNIP_EVENT, PREVIEW_ENABLE_BROWSE_EVENT, BROWSE_MODE_EVENT, BROWSE_MODE_REQUEST_EVENT } from '../components/WebPreviewPanel'
 import { detectPreviewUrl, previewFeedDecision } from '../utils/detectPreviewUrl'
 import { fileLandingSlot } from '../utils/uploadRouting'
 import ChatSidebar, { SIDEBAR_MIN, SIDEBAR_MAX } from './ChatSidebar'
@@ -982,6 +982,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent(BROWSE_MODE_EVENT, { detail: { on: agentActEnabled } }))
   }, [agentActEnabled])
+  // Answer a panel's mount-time pull for the current consent state. The push
+  // above only fires when the VALUE changes, so a panel that mounts later (every
+  // agent-triggered open) would otherwise never hear it, default to false, and
+  // mirror that false into the main process — revoking a live grant.
+  useEffect(() => {
+    const onRequest = () => {
+      window.dispatchEvent(new CustomEvent(BROWSE_MODE_EVENT, { detail: { on: agentActRef.current } }))
+    }
+    window.addEventListener(BROWSE_MODE_REQUEST_EVENT, onRequest)
+    return () => window.removeEventListener(BROWSE_MODE_REQUEST_EVENT, onRequest)
+  }, [])
   // The Browser panel's "Let the agent act" button requests granting native-act
   // consent for the active slot (idempotent — never revokes it).
   useEffect(() => {
@@ -4016,6 +4027,42 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     window.addEventListener('kirocrew-browser-frame', onFrame)
     return () => window.removeEventListener('kirocrew-browser-frame', onFrame)
+  }, [dispatch])
+  // Declare the active chat session to the Electron main process so the agent
+  // command channel polls the gateway for it. Without this, a chat whose Browser
+  // tab was never opened has no panel entry, the command bus answers "no panel",
+  // and the first "open this page" degrades to the Playwright mirror — the whole
+  // reason the built-in browser looked unused. Registering is not authorization:
+  // every op still runs its per-class gate in the main process.
+  useEffect(() => {
+    const api = (window as unknown as {
+      browserAPI?: { registerSession?: (id: string) => Promise<unknown> }
+    }).browserAPI
+    if (!api?.registerSession || !activeSlot) return      // plain browser (no bridge)
+    void api.registerSession(activeSlot)
+  }, [activeSlot])
+  // Native counterpart of the mirror auto-open above. When the agent opens a page
+  // in the BUILT-IN browser, the WebContentsView is created in the Electron main
+  // process but the dashboard owns layout — until the Browser panel mounts and
+  // reports its rect, the page is composited nowhere and the user sees nothing.
+  // So surface the panel on the main process's `browser:agent-opened` signal.
+  //
+  // Same active-slot guard as the mirror path: a background session's page must
+  // not open another session's panel.
+  useEffect(() => {
+    const api = (window as unknown as {
+      browserAPI?: { onAgentOpened?: (cb: (p: { panelId?: string }) => void) => () => void }
+    }).browserAPI
+    if (!api?.onAgentOpened) return      // plain browser (no preload bridge)
+    return api.onAgentOpened(({ panelId }) => {
+      if (!panelId || panelId !== activeSlotRef.current) return
+      dispatch(openActivityPanel())
+      tabsCtlRef.current.openView('browser')
+      // No consent replay here on purpose: dispatching now would fire BEFORE the
+      // panel React-mounts and registers its listener, so nothing would hear it.
+      // The panel pulls the current value itself on mount
+      // (BROWSE_MODE_REQUEST_EVENT), which is ordering-independent.
+    })
   }, [dispatch])
   // "Run in terminal" (from chat code blocks): open a FRESH terminal tab in
   // this chat and run the command in it, starting in the chat's working dir.

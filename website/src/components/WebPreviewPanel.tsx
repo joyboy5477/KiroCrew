@@ -56,7 +56,7 @@ export const PREVIEW_FOCUS_EVENT = 'kirocrew-preview-focus'
  */
 export const PREVIEW_SNIP_EVENT = 'kirocrew-web-preview-snip'
 /**
- * Window event: the panel requests enabling "Let the agent use the browser" (operate mode) so the
+ * Window event: the panel requests enabling "Let the agent act on pages" (operate mode) so the
  * agent may actively drive the browser. ChatPage listens and turns browse mode
  * on for the active slot. Fired by the live mirror's "Let the agent act" button.
  */
@@ -67,6 +67,17 @@ export const PREVIEW_ENABLE_BROWSE_EVENT = 'kirocrew-enable-browse'
  * browse mode is OFF.
  */
 export const BROWSE_MODE_EVENT = 'kirocrew-browse-mode'
+/**
+ * Panel -> ChatPage: "tell me the current consent state for this slot".
+ *
+ * `BROWSE_MODE_EVENT` is a PUSH, and a push only reaches listeners that are
+ * already mounted. A panel that mounts LATER than the push — which is every
+ * agent-triggered open, since the panel is created by the same click that would
+ * broadcast — would sit at its `useState(false)` default and then mirror that
+ * `false` into the main process, silently revoking a grant the user had given.
+ * So the panel pulls on mount instead of hoping a push is in flight.
+ */
+export const BROWSE_MODE_REQUEST_EVENT = 'kirocrew-browse-mode-request'
 /**
  * How long after the last agent-browse frame we keep the live mirror on screen
  * before falling back to the preview body. Frames arrive only when the agent
@@ -362,12 +373,17 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // they go stale (LIVE_FRAME_TTL_MS) we fall back to the preview body.
   const { frame, lastTs, sessionKey: frameSessionKey, sessionName } = useBrowserFrame()
   const [nowTick, setNowTick] = useState(() => Date.now())
-  // Whether "Let the agent use the browser" (operate) is currently on — broadcast by ChatPage so
+  // Whether "Let the agent act on pages" (operate) is currently on — broadcast by ChatPage so
   // the mirror can show "Let the agent act" only while it's off.
   const [browseOn, setBrowseOn] = useState(false)
   useEffect(() => {
     const onMode = (e: Event) => setBrowseOn(!!(e as CustomEvent<{ on?: boolean }>).detail?.on)
     window.addEventListener(BROWSE_MODE_EVENT, onMode)
+    // Ask for the current value now that the listener exists. Without this the
+    // panel would keep its `false` default whenever it mounted after the push
+    // (every agent-triggered open) and then push that false into the main
+    // process, revoking a grant the user already gave.
+    window.dispatchEvent(new CustomEvent(BROWSE_MODE_REQUEST_EVENT))
     return () => window.removeEventListener(BROWSE_MODE_EVENT, onMode)
   }, [])
   // While frames are live, re-evaluate staleness on an interval so the mirror
@@ -693,7 +709,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
         <span className="shrink-0 text-[13px] font-medium text-text">{i18nT('components.webPreviewPanel.browser_live')}</span>
         <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--ok)' }} aria-hidden />
         <div className="flex-1" />
-        {/* Globe toggle ("Let the agent use the browser") wiring: turning it on
+        {/* Globe toggle ("Let the agent act on pages") wiring: turning it on
             acquires in-process (LIGHT) agent control of THIS native view; off
             releases it. `requestInteraction` asks ChatPage to flip the toggle on
             for this session — the hook (agentActEnabled: browseOn) then drives
