@@ -134,6 +134,39 @@ class TestCustomAdd:
         finally:
             await client.close()
 
+    async def test_remote_spec_keeps_scopes_and_client_id(self, sandbox, fake_sel):
+        """A Connect writes the card's promised access; the entry must carry it."""
+        spec = {
+            "url": "https://api.githubcopilot.com/mcp/",
+            "scopes": ["read:user", "read:org"],
+            "clientId": "public-client-id",
+        }
+        client = await _client()
+        try:
+            resp = await client.post("/api/mcp/custom", json={"servers": {"github": spec}})
+            assert resp.status == 200
+            entry = _written(sandbox)["github"]
+            assert entry["scopes"] == ["read:user", "read:org"]
+            assert entry["clientId"] == "public-client-id"
+        finally:
+            await client.close()
+
+    async def test_remote_spec_drops_empty_oauth_hints(self, sandbox, fake_sel):
+        """Empty optionals are dropped, matching args/env — no noise keys on disk."""
+        spec = {"url": "https://mcp.example.com/sse", "scopes": [], "clientId": ""}
+        client = await _client()
+        try:
+            resp = await client.post("/api/mcp/custom", json={"servers": {"remote": spec}})
+            assert resp.status == 400, "an empty clientId is malformed, not an omission"
+            spec.pop("clientId")
+            resp = await client.post("/api/mcp/custom", json={"servers": {"remote": spec}})
+            assert resp.status == 200
+            entry = _written(sandbox)["remote"]
+            assert "scopes" not in entry
+            assert "clientId" not in entry
+        finally:
+            await client.close()
+
     async def test_multi_add_writes_all(self, sandbox, fake_sel):
         client = await _client()
         try:
@@ -198,6 +231,14 @@ class TestCustomAdd:
             ({"command": "npx", "env": {"K": 1}}, "string values"),
             ({"url": "ftp://mcp.example.com"}, "http(s)"),
             ({"url": "https://x.example", "env": {"K": "v"}}, "not valid on a remote"),
+            ({"url": "https://x.example", "scopes": "read"}, "list of non-empty strings"),
+            ({"url": "https://x.example", "scopes": ["read", 7]}, "list of non-empty strings"),
+            ({"url": "https://x.example", "scopes": ["read", ""]}, "list of non-empty strings"),
+            ({"url": "https://x.example", "clientId": ""}, "'clientId' must be a non-empty"),
+            ({"url": "https://x.example", "clientId": "   "}, "'clientId' must be a non-empty"),
+            ({"url": "https://x.example", "clientId": 42}, "'clientId' must be a non-empty"),
+            ({"command": "npx", "scopes": ["read"]}, "not valid on a stdio"),
+            ({"command": "npx", "clientId": "public-id"}, "not valid on a stdio"),
             ("npx -y thing", "must be an object"),
         ],
     )
@@ -358,6 +399,34 @@ class TestCustomGet:
             assert body["enabled"] is False
             assert body["spec"]["env"] == {"KEY": ""}  # env preserved for prefill
             assert "disabled" not in body["spec"]
+        finally:
+            await client.close()
+
+    async def test_oauth_hints_round_trip_without_echoing_authorization(
+        self, sandbox, fake_sel
+    ):
+        """scopes/clientId survive GET→PUT unchanged, alongside a header entry."""
+        entry = {
+            "url": "https://api.githubcopilot.com/mcp/",
+            "headers": {"Authorization": "Bearer custom-secret"},
+            "scopes": ["read:user"],
+            "clientId": "public-client-id",
+        }
+        sandbox.kirocrew_json.write_text(json.dumps({"mcpServers": {"github": entry}}))
+        client = await _client()
+        try:
+            resp = await client.get("/api/mcp/custom/github")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["spec"]["scopes"] == ["read:user"]
+            assert body["spec"]["clientId"] == "public-client-id"
+
+            resp = await client.put("/api/mcp/custom/github", json={"spec": body["spec"]})
+            assert resp.status == 200
+            written = _written(sandbox)["github"]
+            assert written["scopes"] == ["read:user"]
+            assert written["clientId"] == "public-client-id"
+            assert written["headers"] == {"Authorization": "Bearer custom-secret"}
         finally:
             await client.close()
 

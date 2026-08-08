@@ -58,7 +58,7 @@ from kiro_crew.config.paths import (
     kiro_agents_dir,
 )
 from kiro_crew.env import augmented_path
-from kiro_crew.mcp_utils import mcp_server_alias
+from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform import safe_context_call
@@ -2314,12 +2314,47 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         return shutil.which(cmd, path=augmented_path(base))
 
     valid_servers: dict[str, Any] = {}
+    # Names some live source still declares. The rebuild uses the EXISTING config
+    # as its base, so an entry outlives the deletion of its last source -- and for
+    # a remote server that entry carries the OAuth hints we rendered last time.
+    # Preserving those is only right while a file we do not control still holds
+    # them; once nothing declares the name, the surviving copy is our own prior
+    # output, and keeping it would go on requesting access no config asks for.
+    _declared_names = (
+        set(extra_shared_mcp)
+        | set(shared_mcp)
+        | set(kirocrew_mcp)
+        | managed_names
+        | set(_collect_app_mcp_servers())
+    )
     for name, spec in config.get("mcpServers", {}).items():
         if not isinstance(spec, dict):
             continue
-        # Remote Streamable HTTP servers — preserve as-is (url-based, no command)
+        # Remote Streamable HTTP servers — preserved as-is except for the OAuth
+        # hints, which are renamed to the fields kiro-cli actually deserializes.
+        # This is the one boundary where the internal spelling (``scopes`` /
+        # ``clientId``, what mcp.json and the UI use) becomes the wire spelling,
+        # so every source file keeps one shape and only the emitted spec changes.
+        #
+        # The dashboard store's own entry answers both ownership and source. A
+        # usable dict means the store owns this name and states its hints (in
+        # either spelling -- the scope-toggle preservation rule copies a global
+        # spec in verbatim, so a store entry can legitimately hold wire form).
+        # Anything else -- absent, or a malformed value the merge above skipped
+        # and which therefore supplied nothing -- means we own nothing here, and
+        # the entry's own wire values are the only copy of configuration written
+        # in a file we do not control.
         if spec.get("url"):
-            valid_servers[name] = spec
+            # An orphan -- no source declares the name -- is answered with an
+            # empty owned entry rather than ``None``: the same three-state rule
+            # then reads "the authoritative source states no hints" and clears
+            # them, instead of reading "we own nothing here" and preserving a
+            # file's values. Sub-keys we never owned (``oauth.issuer``) still
+            # survive, because the hints are edited surgically either way.
+            _store_entry = kirocrew_mcp.get(name)
+            if _store_entry is None and name not in _declared_names:
+                _store_entry = {}
+            valid_servers[name] = kiro_oauth_wire_entry(spec, store_entry=_store_entry)
             continue
         # Build candidate specs in priority order: the merged winner first,
         # then the same server from each source as a resolution fallback.
@@ -2397,15 +2432,45 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     # These are explicitly installed by the user via `aim mcp install` or
     # manual mcp.json edits — unlike managed servers, they should always
     # be registered regardless of fresh/existing config state.
+    #
+    # ``kirocrew_mcp`` is in this chain for the same reason: it holds every entry
+    # the user added through the dashboard, including Connections providers. It
+    # was omitted originally, and because ``tools`` is a CLOSED allowlist (no
+    # wildcard) the result was silent and total — kiro-cli mounted a connected
+    # provider and exposed none of its tools, so a fully consented Notion
+    # connection still answered "I don't have a Notion integration". The entry
+    # reached ``mcpServers`` (via the merges above) but never ``tools``.
     _shared_added: list[str] = []
     _shared_removed: list[str] = []
     _shared_not_auto: list[str] = []
-    for name, spec in itertools.chain(extra_shared_mcp.items(), shared_mcp.items()):
+    # ``disabled`` is TIGHTEST-WINS across scopes, because the scopes disagree by
+    # design: ``POST /api/mcp/toggle enabled:false`` writes ``disabled: true``
+    # into the kiro global ONLY, so a same-named dashboard-store entry legitimately
+    # carries no such key -- and this chain visits the store LAST. Judging each
+    # spec in isolation would let that final entry undo the earlier removal,
+    # clear the flag off the emitted spec, and re-add the ref to BOTH lists.
+    # ``allowedTools`` is the one path that never reaches the PreToolUse gate, so
+    # the operator's disable would be silently void for every tool on that server.
+    #
+    # Both sides are keyed by the ALIAS, not the raw key, because that is the
+    # identity the emitted ref carries and the mapping is many-to-one: a slashed
+    # global key and a slash-free store key are different dict keys that mount the
+    # same ``@ref``. Comparing raw keys would let the alias-spelled entry look
+    # like a different server and re-add the ref the disable just removed.
+    _disabled_anywhere = {
+        mcp_server_alias(srv)
+        for scope in (extra_shared_mcp, shared_mcp, kirocrew_mcp)
+        for srv, srv_spec in scope.items()
+        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+    }
+    for name, spec in itertools.chain(
+        extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items()
+    ):
         if not isinstance(spec, dict) or name in managed_names:
             continue
         alias = mcp_server_alias(name)
         ref = f"@{alias}"
-        if spec.get("disabled"):
+        if spec.get("disabled") or alias in _disabled_anywhere:
             for key in ("tools", "allowedTools"):
                 lst = config.get(key)
                 if lst is not None and ref in lst:

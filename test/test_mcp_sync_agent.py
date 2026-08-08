@@ -55,6 +55,153 @@ def _load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+async def _sync_one_remote(remote, mcp_env, *, owned: bool = True) -> dict:
+    """Run api_mcp_sync over one remote server and return its written global entry.
+
+    ``owned`` marks the name as managed by Kiro Crew, which is the regime every caller
+    here exercises: writes to the kiro-global mcp.json are gated on ownership, so
+    an unowned name is deliberately left untouched (see
+    TestGlobalWritesAreOwnershipGated).
+    """
+    from kiro_crew.dashboard.handlers.mcp import api_mcp_sync
+    from kiro_crew.mcp_discovery import SCOPE_KIROCREW
+
+    req = MagicMock()
+    req.app = {"state": MagicMock()}
+    _store = {remote.name: {"url": "https://store"}} if owned else {}
+    with (
+        patch("kiro_crew.mcp_discovery.discover_servers_to_sync", return_value=[remote]),
+        patch("kiro_crew.mcp_discovery.sync_to_agent_config", return_value=True),
+        patch("kiro_crew.mcp_discovery.register_servers_for_cc"),
+        patch(
+            "kiro_crew.mcp_discovery._load_mcp_json_by_source",
+            return_value={SCOPE_KIROCREW: _store},
+        ),
+        patch("kiro_crew.dashboard.handlers.mcp._get_mcp_lock") as mock_lock,
+        patch("kiro_crew.dashboard.handlers.mcp._write_mcp_json") as mock_write,
+        patch("kiro_crew.dashboard.handlers.mcp._sync_mcp_to_agent_batch"),
+        patch(
+            "kiro_crew.dashboard.handlers.sessions._reset_all_sessions",
+            new_callable=AsyncMock,
+            return_value=1,
+        ),
+    ):
+        mock_lock.return_value = AsyncMock()
+        resp = await api_mcp_sync(req)
+
+    assert resp.status == 200
+    return mock_write.call_args.args[0]["mcpServers"][remote.name]
+
+
+class TestGlobalWritesAreOwnershipGated:
+    """Every write to a config surface we do NOT own is gated on ownership.
+
+    Two such surfaces are touched here: the kiro-global ``mcp.json`` (through
+    ``api_mcp_sync``) and the Claude Code ``~/.mcp.json`` sidecar (through
+    ``register_servers_for_cc``). Both are fed by the SAME source --
+    ``discover_servers_to_sync``, which merges every scope -- so a name the user
+    configured only in their own global file arrives exactly like a managed one.
+
+    Parametrized on purpose: the gate was previously reasoned about one write site
+    at a time, so a per-site test lets the next site ship ungated. This asserts
+    the property across all of them at once.
+    """
+
+    @staticmethod
+    def _own(names: set[str]):
+        """Patch the store scope so ``kirocrew_managed_names`` sees exactly ``names``."""
+        from kiro_crew.mcp_discovery import SCOPE_KIROCREW
+
+        return patch(
+            "kiro_crew.mcp_discovery._load_mcp_json_by_source",
+            return_value={SCOPE_KIROCREW: {n: {"url": "https://store"} for n in names}},
+        )
+
+    async def _kiro_global(self, *, managed: bool, mcp_env) -> dict:
+        """Sync a remote whose url differs from the user's global entry."""
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        _, mcp_json = mcp_env
+        data = _load(mcp_json)
+        data["mcpServers"]["handmade"] = {
+            "url": "https://user.example.com/mcp",
+            "headers": {"Authorization": "Bearer user-typed"},
+            "oauthScopes": ["user:scope"],
+            "oauth": {"clientId": "user-client", "issuer": "https://user-issuer"},
+        }
+        mcp_json.write_text(json.dumps(data))
+        remote = McpServerInfo(
+            name="handmade",
+            url="https://kirocrew.example.com/mcp",
+            scopes=["kirocrew:scope"],
+            client_id="kirocrew-client",
+            source="discovered",
+        )
+        return await _sync_one_remote(remote, mcp_env, owned=managed)
+
+    def _cc_sidecar(self, *, managed: bool, tmp_path) -> dict:
+        """Register a remote into the CC sidecar."""
+        from kiro_crew.mcp_discovery import McpServerInfo, register_servers_for_cc
+
+        sidecar = tmp_path / "cc.json"
+        remote = McpServerInfo(
+            name="handmade",
+            url="https://kirocrew.example.com/mcp",
+            scopes=["kirocrew:scope"],
+            client_id="kirocrew-client",
+            source="discovered",
+        )
+        with self._own({"handmade"} if managed else set()):
+            register_servers_for_cc([remote], mcp_json_path=sidecar)
+        return json.loads(sidecar.read_text())["mcpServers"]["handmade"]
+
+    @pytest.mark.asyncio
+    async def test_an_unmanaged_name_is_never_modified_at_any_global_write_site(
+        self, mcp_env, tmp_path
+    ):
+        """The user's own global config is not ours to rewrite."""
+        # Site 1 -- kiro-global mcp.json: the entry must come back byte-identical.
+        entry = await self._kiro_global(managed=False, mcp_env=mcp_env)
+        assert entry == {
+            "url": "https://user.example.com/mcp",
+            "headers": {"Authorization": "Bearer user-typed"},
+            "oauthScopes": ["user:scope"],
+            "oauth": {"clientId": "user-client", "issuer": "https://user-issuer"},
+        }
+
+        # Site 2 -- CC sidecar: our OAuth hints are not written for a name we do
+        # not own. (The wholesale rebuild of the entry itself is pre-existing
+        # behaviour on the base ref, unchanged here.)
+        cc = self._cc_sidecar(managed=False, tmp_path=tmp_path)
+        assert "scopes" not in cc
+        assert "clientId" not in cc
+
+    @pytest.mark.asyncio
+    async def test_a_managed_name_still_syncs_at_every_global_write_site(
+        self, mcp_env, tmp_path
+    ):
+        """The gate must not disable the re-sync this change exists to deliver."""
+        entry = await self._kiro_global(managed=True, mcp_env=mcp_env)
+        assert entry["url"] == "https://kirocrew.example.com/mcp"
+        assert entry["oauthScopes"] == ["kirocrew:scope"]
+        assert entry["oauth"]["clientId"] == "kirocrew-client"
+        assert entry["oauth"]["issuer"] == "https://user-issuer", "sub-key still survives"
+
+        cc = self._cc_sidecar(managed=True, tmp_path=tmp_path)
+        assert cc["scopes"] == ["kirocrew:scope"]
+        assert cc["clientId"] == "kirocrew-client"
+
+    def test_a_malformed_store_value_does_not_make_a_name_managed(self, tmp_path):
+        """Same discriminator as the agent-spec path: a non-dict is not ownership."""
+        from kiro_crew.mcp_discovery import SCOPE_KIROCREW, kirocrew_managed_names
+
+        with patch(
+            "kiro_crew.mcp_discovery._load_mcp_json_by_source",
+            return_value={SCOPE_KIROCREW: {"good": {"url": "https://x"}, "bad": "not-a-dict"}},
+        ):
+            assert kirocrew_managed_names() == {"good"}
+
+
 class TestSyncMcpToAgent:
     def test_enable_adds_server_and_tool_refs(self, mcp_env):
         agent_cfg, _ = mcp_env
@@ -301,6 +448,168 @@ class TestApiMcpSyncToolsUpdate:
 
         assert resp.status == 200
         mock_batch.assert_called_once_with(["aws-outlook-mcp"], enabled=True)
+
+    @pytest.mark.asyncio
+    async def test_sync_writes_remote_url_and_headers_to_global_config(self, mcp_env):
+        """A remote sync must never be serialized as an empty stdio command."""
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        _, mcp_json = mcp_env
+        data = _load(mcp_json)
+        data["mcpServers"]["remote"] = {
+            "url": "https://mcp.example.com/v1",
+            "headers": {"Authorization": "Bearer old"},
+            "disabled": True,
+            "disabledTools": ["write"],
+        }
+        mcp_json.write_text(json.dumps(data))
+        remote = McpServerInfo(
+            name="remote",
+            url="https://mcp.example.com/v2",
+            headers={"Authorization": "Bearer current"},
+            source="discovered",
+        )
+        written = await _sync_one_remote(remote, mcp_env)
+        assert written == {
+            "url": "https://mcp.example.com/v2",
+            "headers": {"Authorization": "Bearer current"},
+            "disabled": True,
+            "disabledTools": ["write"],
+        }
+        assert "command" not in written
+
+    @pytest.mark.asyncio
+    async def test_sync_writes_remote_oauth_hints_to_global_config(self, mcp_env):
+        """Hints reach kiro-cli in the WIRE spellings, or the grant is never requested.
+
+        kiro-cli only deserializes ``oauthScopes`` and ``oauth.clientId`` and drops
+        unknown keys silently, so asserting the internal ``scopes``/``clientId``
+        spellings here would guard the bug instead of the fix.
+        """
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        remote = McpServerInfo(
+            name="remote",
+            url="https://api.githubcopilot.com/mcp/",
+            scopes=["read:user", "read:org"],
+            client_id="public-client-id",
+            source="discovered",
+        )
+        written = await _sync_one_remote(remote, mcp_env)
+        assert written == {
+            "url": "https://api.githubcopilot.com/mcp/",
+            "oauthScopes": ["read:user", "read:org"],
+            "oauth": {"clientId": "public-client-id"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_sync_removes_oauth_hints_dropped_upstream(self, mcp_env):
+        """Absent upstream means REMOVED, so narrowing a scope actually narrows it."""
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        _, mcp_json = mcp_env
+        data = _load(mcp_json)
+        data["mcpServers"]["remote"] = {
+            "url": "https://mcp.example.com/v1",
+            "scopes": ["read", "write"],
+            "clientId": "stale-id",
+            "disabledTools": ["write"],
+        }
+        mcp_json.write_text(json.dumps(data))
+        remote = McpServerInfo(
+            name="remote", url="https://mcp.example.com/v1", source="discovered"
+        )
+        written = await _sync_one_remote(remote, mcp_env)
+        assert written == {
+            "url": "https://mcp.example.com/v1",
+            "disabledTools": ["write"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_sync_preserves_a_header_discovery_cannot_see(self, mcp_env):
+        """A header-less discovered remote must NOT erase a configured header.
+
+        Discovery reads the dashboard's own mcp.json. A server of the same name
+        carrying an Authorization header in the user's global
+        ~/.kiro/settings/mcp.json therefore arrives here header-less, and popping
+        on that would destroy the only copy of a credential the user typed --
+        silently, with nothing to restore it from.
+        """
+        _, mcp_json = mcp_env
+        data = _load(mcp_json)
+        data["mcpServers"]["remote"] = {
+            "url": "https://mcp.example.com/v1",
+            "headers": {"Authorization": "Bearer user-typed"},
+        }
+        mcp_json.write_text(json.dumps(data))
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        remote = McpServerInfo(
+            name="remote", url="https://mcp.example.com/v1", source="discovered"
+        )
+        written = await _sync_one_remote(remote, mcp_env)
+        assert written["headers"] == {"Authorization": "Bearer user-typed"}
+
+    @pytest.mark.asyncio
+    async def test_sync_keeps_unrelated_oauth_subkeys_while_rewriting_client_id(self, mcp_env):
+        """Only ``clientId`` under ``oauth`` is ours; ``issuer`` is the user's.
+
+        Deleting the whole mapping to rewrite our one sub-key destroys hand-set
+        configuration a sync has no business touching.
+        """
+        _, mcp_json = mcp_env
+        data = _load(mcp_json)
+        data["mcpServers"]["remote"] = {
+            "url": "https://mcp.example.com/v1",
+            "oauthScopes": ["read"],
+            "oauth": {"issuer": "https://issuer.example.com", "clientId": "old-id"},
+        }
+        mcp_json.write_text(json.dumps(data))
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        remote = McpServerInfo(
+            name="remote",
+            url="https://mcp.example.com/v1",
+            scopes=["read", "write"],
+            client_id="new-id",
+            source="discovered",
+        )
+        written = await _sync_one_remote(remote, mcp_env)
+        assert written["oauthScopes"] == ["read", "write"]
+        assert written["oauth"] == {"issuer": "https://issuer.example.com", "clientId": "new-id"}
+
+    @pytest.mark.asyncio
+    async def test_sync_omits_a_malformed_scope_list_instead_of_truncating_it(self, mcp_env):
+        """Row 6 on the sync path: one validation contract, emit and readback.
+
+        A partially-valid list must never be silently narrowed into a different
+        grant. Reading ``["read", 7]`` as ``["read"]`` while the emit path omits
+        the field entirely would make the synced file request access the source
+        never asked for, and the agent spec request none -- two different answers
+        from one line of config.
+        """
+        _, mcp_json = mcp_env
+        data = _load(mcp_json)
+        data["mcpServers"]["remote"] = {
+            "url": "https://mcp.example.com/v1",
+            "scopes": ["read", 7],
+        }
+        mcp_json.write_text(json.dumps(data))
+        from kiro_crew.mcp_discovery import _spec_scopes
+
+        assert _spec_scopes(data["mcpServers"]["remote"]) == [], "readback must omit, not truncate"
+
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        remote = McpServerInfo(
+            name="remote",
+            url="https://mcp.example.com/v1",
+            scopes=_spec_scopes(data["mcpServers"]["remote"]),
+            source="discovered",
+        )
+        written = await _sync_one_remote(remote, mcp_env)
+        assert "oauthScopes" not in written
+        assert "scopes" not in written
 
     @pytest.mark.asyncio
     async def test_sync_no_tools_update_when_nothing_discovered(self, mcp_env):

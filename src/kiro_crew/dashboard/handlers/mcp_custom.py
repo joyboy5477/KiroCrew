@@ -43,7 +43,13 @@ _MAX_SERVERS_PER_ADD = 20
 # are rejected by name rather than silently dropped or passed through to
 # the process spawner.
 _STDIO_KEYS = {"command", "args", "env"}
-_REMOTE_KEYS = {"url"}
+# ``scopes`` and ``clientId`` are OAuth hints carried to the runtime verbatim.
+# Kiro Crew validates only their SHAPE and never interprets them: the runtime
+# owns the authorization exchange, so scope narrowing and client registration
+# are its decisions, not ours.  A clientId is a public OAuth identifier — the
+# corresponding secret never lives in an MCP spec — so neither key is redacted.
+_REMOTE_ONLY_KEYS = {"scopes", "clientId"}
+_REMOTE_KEYS = {"url"} | _REMOTE_ONLY_KEYS
 _ALLOWED_SPEC_KEYS = _STDIO_KEYS | _REMOTE_KEYS
 
 
@@ -81,11 +87,23 @@ def _validate_spec(spec: object, carried_keys: frozenset[str] = frozenset()) -> 
             return "'url' must be an http(s) URL"
         for key in _STDIO_KEYS & set(spec):
             return f"'{key}' is not valid on a remote (url) server"
+        if "scopes" in spec:
+            scopes = spec["scopes"]
+            if not isinstance(scopes, list) or any(
+                not isinstance(scope, str) or not scope.strip() for scope in scopes
+            ):
+                return "'scopes' must be a list of non-empty strings"
+        if "clientId" in spec:
+            client_id = spec["clientId"]
+            if not isinstance(client_id, str) or not client_id.strip():
+                return "'clientId' must be a non-empty string"
         return None
 
     command = spec["command"]
     if not isinstance(command, str) or not command.strip():
         return "'command' must be a non-empty string"
+    for key in sorted(_REMOTE_ONLY_KEYS & set(spec)):
+        return f"'{key}' is not valid on a stdio (command) server"
     args = spec.get("args", [])
     if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
         return "'args' must be a list of strings"
@@ -99,9 +117,15 @@ def _validate_spec(spec: object, carried_keys: frozenset[str] = frozenset()) -> 
 
 def _clean_spec(spec: dict) -> dict:
     """Normalized copy of a validated spec (drops empty optionals)."""
+    out: dict = {}
     if "url" in spec:
-        return {"url": spec["url"]}
-    out: dict = {"command": spec["command"].strip()}
+        out["url"] = spec["url"]
+        if spec.get("scopes"):
+            out["scopes"] = list(spec["scopes"])
+        if spec.get("clientId"):
+            out["clientId"] = spec["clientId"]
+        return out
+    out["command"] = spec["command"].strip()
     if spec.get("args"):
         out["args"] = list(spec["args"])
     if spec.get("env"):
