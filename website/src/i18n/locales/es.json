@@ -5652,6 +5652,15 @@
       "undo_remove": "Deshacer la eliminación",
       "will_be_removed_on_save": "Se eliminará al guardar."
     },
+    "sendToInstanceSubmenu": {
+      "failed": "Falló",
+      "not_connected": "no conectado",
+      "send_a_copy_to": "Enviar una copia a",
+      "sent": "Enviado",
+      "sent_transcript_only": "Enviado (solo transcripción)",
+      "transcript_only_hint": "El par no pudo restaurar el contexto completo de la conversación, así que esta copia se reanuda solo desde la transcripción.",
+      "unknown_error": "Error desconocido"
+    },
     "sessionActionsMenu": {
       "bring_back_to_main": "Devolver a la ventana principal",
       "close_session": "Cerrar la sesión",

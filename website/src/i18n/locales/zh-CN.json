@@ -5484,6 +5484,15 @@
       "undo_remove": "撤销移除",
       "will_be_removed_on_save": "保存时将被移除。"
     },
+    "sendToInstanceSubmenu": {
+      "failed": "失败",
+      "not_connected": "未连接",
+      "send_a_copy_to": "发送副本到",
+      "sent": "已发送",
+      "sent_transcript_only": "已发送（仅对话记录）",
+      "transcript_only_hint": "对端无法恢复完整的对话上下文，因此此副本仅从对话记录继续。",
+      "unknown_error": "未知错误"
+    },
     "sessionActionsMenu": {
       "bring_back_to_main": "移回主窗口",
       "close_session": "关闭会话",

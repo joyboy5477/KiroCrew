@@ -5568,6 +5568,15 @@
       "undo_remove": "Entfernen rückgängig machen",
       "will_be_removed_on_save": "Wird beim Speichern entfernt."
     },
+    "sendToInstanceSubmenu": {
+      "failed": "Fehlgeschlagen",
+      "not_connected": "nicht verbunden",
+      "send_a_copy_to": "Kopie senden an",
+      "sent": "Gesendet",
+      "sent_transcript_only": "Gesendet (nur Transkript)",
+      "transcript_only_hint": "Die Gegenstelle konnte den vollständigen Gesprächskontext nicht wiederherstellen; diese Kopie setzt nur auf dem Transkript fort.",
+      "unknown_error": "Unbekannter Fehler"
+    },
     "sessionActionsMenu": {
       "bring_back_to_main": "Zurück ins Hauptfenster holen",
       "close_session": "Sitzung schließen",
