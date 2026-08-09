@@ -27,6 +27,29 @@ class TestBatchParse(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(P.parse_batch(""), [])
 
+    def test_a_malformed_link_does_not_sink_the_batch(self):
+        # "https://[::1" makes urlparse raise ValueError. The user-facing failure
+        # this guards: one malformed entry in a pasted batch used to crash the
+        # whole request (HTTP 500), discarding every valid link with it.
+        out = P.parse_batch("https://github.com/o/r/pull/3\n"
+                            "https://[::1\n"
+                            "https://github.com/o/r/pull/4")
+        self.assertEqual(out, ["https://github.com/o/r/pull/3",
+                               "https://github.com/o/r/pull/4"])
+
+    def test_ghe_links_keep_their_host(self):
+        cfg = {"github_hosts": ["github.com", "acme.ghe.com"]}
+        text = ("https://acme.ghe.com/org/repo/pull/9\n"
+                "https://github.com/o/r/pull/3\n"
+                "https://evil.example/github.com/x/y/pull/1")
+        with mock.patch.object(P.adapters.store, "read_config_quiet",
+                               return_value=cfg):
+            out = P.parse_batch(text)
+        # The GHE host survives normalization (flattening it to github.com would
+        # point the review at the wrong instance); the path-spoof is dropped.
+        self.assertEqual(out, ["https://acme.ghe.com/org/repo/pull/9",
+                               "https://github.com/o/r/pull/3"])
+
 
 class TestRulePack(unittest.TestCase):
     def test_unmapped_repo_returns_none(self):

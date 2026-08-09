@@ -58,7 +58,8 @@ def _redact(text: str) -> str:
 
 def parse_batch(text: str) -> list[str]:
     """Split a pasted blob (newline/comma separated) into a de-duplicated,
-    order-preserving list of GitHub PR URLs. Non-PR tokens are dropped."""
+    order-preserving list of PR URLs on allowed GitHub hosts (github.com plus
+    any configured GitHub Enterprise host). Non-PR tokens are dropped."""
     if not text:
         return []
     seen: set[str] = set()
@@ -68,10 +69,10 @@ def parse_batch(text: str) -> list[str]:
         if not tok:
             continue
         try:
-            owner, repo, number = adapters.github_pr_parts(tok)
+            host, owner, repo, number = adapters.github_pr_ref(tok)
         except adapters.AdapterParseError:
             continue
-        link = f"https://github.com/{owner}/{repo}/pull/{number}"
+        link = f"https://{host}/{owner}/{repo}/pull/{number}"
         key = link.lower()
         if key not in seen:
             seen.add(key)
@@ -79,14 +80,18 @@ def parse_batch(text: str) -> list[str]:
     return out
 
 
-def list_open_prs(owner: str, repo: str, *, timeout: float = 60.0) -> list[dict]:
+def list_open_prs(owner: str, repo: str, *, host: str = "github.com",
+                  timeout: float = 60.0) -> list[dict]:
     """Enumerate a repo's OPEN pull requests via the authenticated ``gh`` CLI.
 
     Deterministic backbone (no LLM): runs ``gh api`` with a LIST argv (never
     ``shell=True``). ``owner``/``repo`` are constrained to ``[^/]+`` by
-    ``adapters.parse_repo_url`` before this is called and are interpolated only
+    ``adapters.parse_repo_ref`` before this is called and are interpolated only
     into the ``gh api`` PATH argument (which `gh` treats as an API path, not a
-    shell command), so there is no shell-injection surface. Returns
+    shell command), so there is no shell-injection surface. ``host`` has passed
+    the same parsed-hostname allowlist; a non-github.com (GitHub Enterprise)
+    host is routed to ITS instance's API via ``--hostname`` (``gh`` must be
+    authenticated for it: ``gh auth login --hostname <host>``). Returns
     ``[{url, number, head_sha, title, author, updated_at, draft}]`` in GitHub's
     order. Raises ``RuntimeError`` (with the stderr tail) if `gh` is missing,
     unauthenticated, times out, or the repo can't be read.
@@ -105,6 +110,9 @@ def list_open_prs(owner: str, repo: str, *, timeout: float = 60.0) -> list[dict]
                 "head_sha: .head.sha, title: .title, author: .user.login, "
                 "updated_at: .updated_at, draft: .draft}",
     ]
+    h = adapters.canonical_host(host)
+    if h and h != "github.com":
+        argv += ["--hostname", h]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
                               timeout=timeout, check=False)
@@ -232,9 +240,21 @@ FETCH_SPECS = {
 }
 
 
-def fetch_spec(platform: str) -> str:
-    """FETCH instruction for a platform (GitHub is the only platform)."""
-    return FETCH_SPECS.get(platform, FETCH_SPECS["github"])
+def fetch_spec(platform: str, host: str = "github.com") -> str:
+    """FETCH instruction for a platform (GitHub is the only platform).
+
+    For a GitHub Enterprise host the instruction routes every ``gh api`` call to
+    that instance's API via ``--hostname`` — the host has already passed the
+    adapters' parsed-hostname allowlist, so it is safe to interpolate."""
+    spec = FETCH_SPECS.get(platform, FETCH_SPECS["github"])
+    h = adapters.canonical_host(host)
+    if h and h != "github.com":
+        spec += (
+            f". The PR lives on the GitHub Enterprise host `{h}`: add "
+            f"`--hostname {h}` to EVERY `gh api` call (`gh` must be "
+            f"authenticated for that host: `gh auth login --hostname {h}`)"
+        )
+    return spec
 
 
 def _comment_body(finding: dict) -> str:
