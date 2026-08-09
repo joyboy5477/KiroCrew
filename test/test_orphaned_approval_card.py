@@ -131,7 +131,7 @@ class TestRunnerBackstopContract:
         src = inspect.getsource(chat_runner._run_chat)
         # The pre-seed must appear before the guarded await that follows it.
         preseed = src.index('outcome = "rejected"')
-        await_idx = src.index("await asyncio.wait_for(fut, timeout=7200.0)")
+        await_idx = src.index("await asyncio.wait_for(fut, timeout=_approval_window)")
         assert preseed < await_idx, (
             "outcome must be pre-seeded before the approval await so the "
             "finally backstop is total over cancellation"

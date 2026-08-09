@@ -868,6 +868,324 @@ export function repoBody(ref: RepoRef): Record<string, string> {
   return repoQuery(ref)
 }
 
+// ── crews ───────────────────────────────────────────────────────────────────
+//
+// Every shape below MIRRORS the backend store,
+// `src/kiro_crew/apps/builtins/issue_radar/backend/crew_store.py` — that module is
+// the SOURCE OF TRUTH for the phase list, the three phase classifications, the
+// event kinds and every record field. A crew record has no upstream to refetch
+// from (unlike an issue, where a schema mismatch is just a cache miss), so these
+// types and that module must be changed together.
+
+/** Every phase a work item can be in, in lifecycle order — mirrors
+ * `crew_store.PHASES`. `selected` is local-only and never public: it is the state
+ * between "this issue looks workable" and the claim comment. */
+export const CREW_PHASES = [
+  'selected',
+  'claimed',
+  'investigating',
+  'implementing',
+  'awaiting-ci',
+  'addressing-review',
+  'awaiting-merge',
+  'awaiting-reply',
+  'escalated',
+  'resolved',
+  'skipped',
+  'yielded',
+  'handed-back',
+  'preempted',
+] as const
+
+export type CrewPhase = typeof CREW_PHASES[number]
+
+/** Mirrors `crew_store.EVENT_KINDS`. The store REFUSES an unknown kind, so this
+ * union is enforced server-side rather than merely documented. */
+export const CREW_EVENT_KINDS = [
+  'claim', 'investigate', 'reply', 'implement', 'ci',
+  'review', 'conflict', 'merge', 'escalate', 'handback', 'skip', 'yield',
+] as const
+
+export type CrewEventKind = typeof CREW_EVENT_KINDS[number]
+
+// The three phase classifications, mirroring `crew_store.py`'s frozensets of the
+// same names. They deliberately do NOT coincide, which is why a view must read
+// them from here rather than re-deriving any of them from a phase string:
+//
+//   TERMINAL_PHASES     — the work is over, one way or another.
+//   TTL_ACTIVE_PHASES   — only these age toward the claim TTL. A parked PR or an
+//                         open escalation is stronger evidence of a live claim
+//                         than a heartbeat, and a crew waiting three days on a
+//                         human review has no progress to record.
+//   EDITING_PHASES      — a worktree with uncommitted changes; at most one per
+//                         crew, enforced in the store's `upsert_work_item`.
+
+/** Mirrors `crew_store.TERMINAL_PHASES`. */
+export const TERMINAL_PHASES: ReadonlySet<CrewPhase> = new Set<CrewPhase>([
+  'resolved', 'skipped', 'yielded', 'handed-back', 'preempted',
+])
+
+/** Mirrors `crew_store.TTL_ACTIVE_PHASES`. */
+export const TTL_ACTIVE_PHASES: ReadonlySet<CrewPhase> = new Set<CrewPhase>([
+  'claimed', 'investigating', 'implementing',
+])
+
+/** Mirrors `crew_store.EDITING_PHASES`. */
+export const EDITING_PHASES: ReadonlySet<CrewPhase> = new Set<CrewPhase>([
+  'implementing', 'addressing-review',
+])
+
+/** Whether a work item occupies one of the crew's `max_open` slots — mirrors
+ * `crew_store.open_slot_count`.
+ *
+ * Every NON-TERMINAL phase except `escalated`: an item parked on a human decision
+ * must not consume a work slot, or one unanswered escalation stops the crew
+ * picking up anything else. `escalated` is bounded separately, by `max_escalated`.
+ */
+export function countsTowardOpen(phase: CrewPhase): boolean {
+  return !TERMINAL_PHASES.has(phase) && phase !== 'escalated'
+}
+
+/** One approach the crew already ruled out, so a later turn (or a fresh session
+ * after compaction) does not retry it. */
+export interface CrewTriedEntry {
+  approach: string
+  rejected_because: string
+  at: string
+}
+
+/** CI readings for a work item's PR. Open-ended on purpose: the store MERGES
+ * whatever the crew records into the existing map, and these four keys are the
+ * ones the ledger's flattened `ci_*` fields write. */
+export interface CrewCiState {
+  passed?: number
+  total?: number
+  round?: number
+  inherited_reds?: number
+  [key: string]: unknown
+}
+
+/** A human decision a crew is blocked on. Recorded with the crew's OWN
+ * recommendation — an escalation with no proposal makes the human do all the
+ * work. Rendered on Your Desk. */
+export interface CrewEscalation {
+  question: string
+  options: string[]
+  recommendation: string
+  /** ISO stamp, when the backend recorded one. */
+  at?: string
+}
+
+/** One crew: a persistent worker with a name, a face and a work log.
+ *
+ * `avatar_seed` is stored SEPARATELY from `name` because renaming a crew must not
+ * change its face. `retired_at` non-null means retired — the record, the name
+ * reservation and the work log all survive, so an old claim comment can never be
+ * mistaken for a live claim by a crew that reused the name. */
+export interface Crew {
+  schema: number
+  id: string
+  name: string
+  avatar_seed: string
+  avatar_variant: number | null
+  agent: string
+  model: string
+  extra_prompt: string
+  labels: string[]
+  auto_resolve_conflicts: boolean
+  auto_merge: boolean
+  unattended: boolean
+  max_open: number
+  max_escalated: number
+  worktree_root: string
+  slot_key: string
+  enabled: boolean
+  paused_reason: string
+  created_at: string
+  retired_at: string | null
+}
+
+/** One crew × one issue. `last_progress_at` moves only on REAL progress (the
+ * store enforces that), because the claim TTL is measured from it — a read-back
+ * must not renew a claim. */
+export interface WorkItem {
+  schema: number
+  crew_id: string
+  owner: string
+  repo: string
+  number: number
+  phase: CrewPhase
+  outcome: string | null
+  decision: string
+  why: string
+  next: string
+  tried: CrewTriedEntry[]
+  worktree: string
+  branch: string
+  base_sha: string
+  pr_number: number | null
+  ci_state: CrewCiState
+  claim_comment_id: number | null
+  labels_applied: string[]
+  escalation: CrewEscalation | null
+  /** Null while the item is still `selected` — nothing has been claimed yet. */
+  claimed_at: string | null
+  last_progress_at: string
+  finished_at: string | null
+}
+
+/** One line of the append-only progress ledger. `id` is content-addressed, so a
+ * duplicated line merges on read instead of conflicting.
+ *
+ * `text` IS PUBLIC — it is rendered on the crew page AND inside the claim
+ * comment on the forge. */
+export interface CrewEvent {
+  id: string
+  ts: string
+  crew_id: string
+  number: number
+  kind: CrewEventKind
+  text: string
+}
+
+/** Repo-wide protocol constants. Deliberately NOT per-crew: two crews
+ * negotiating with different TTLs is how a short-TTL crew steals a long-TTL
+ * crew's live work. */
+export interface CrewSettings {
+  schema: number
+  claim_ttl_hours: number
+  escalation_handback_days: number
+  commit_trailer: string
+}
+
+/** The crew-list header tallies, computed server-side so every view agrees. */
+export interface CrewCounts {
+  on_duty: number
+  working: number
+  needs_you: number
+  paused: number
+}
+
+/** Fields a crew edit may carry. Partial — the store drops unknown keys and
+ * validates every known one, so `{}` is a valid (no-op) patch.
+ *
+ * No `paused_reason`: pausing goes through `setCrewPaused`, which also stops the
+ * crew's session. Writing the field alone would leave a paused-looking crew still
+ * working. */
+export interface CrewPatch {
+  name?: string
+  avatar_seed?: string
+  avatar_variant?: number | null
+  agent?: string
+  model?: string
+  extra_prompt?: string
+  worktree_root?: string
+  labels?: string[]
+  auto_resolve_conflicts?: boolean
+  auto_merge?: boolean
+  unattended?: boolean
+  max_open?: number
+  max_escalated?: number
+  enabled?: boolean
+}
+
+/** The create payload. Only `name` is required — the store fills every other
+ * field from its own defaults — and a duplicate name is refused server-side
+ * (409), because the name field is free text and the suggestion chips are only a
+ * convenience. */
+export interface CrewSpec extends CrewPatch {
+  name: string
+}
+
+/** One work-item write. Flat, mirroring the store's own patch vocabulary, and
+ * every field optional: an omitted field keeps what an earlier write stored.
+ *
+ * `tried_approach` (+ `tried_rejected_because`) APPENDS one `tried` entry rather
+ * than replacing the list. `event` + `event_kind` append one ledger line in the
+ * same request, so a phase can never change without a logged reason. */
+export interface WorkItemPatch {
+  phase?: CrewPhase
+  outcome?: string
+  decision?: string
+  why?: string
+  next?: string
+  worktree?: string
+  branch?: string
+  base_sha?: string
+  pr_number?: number | null
+  ci_state?: CrewCiState
+  claim_comment_id?: number | null
+  labels_applied?: string[]
+  escalation?: CrewEscalation | null
+  tried_approach?: string
+  tried_rejected_because?: string
+  /** The PUBLIC progress line (see `CrewEvent.text`). */
+  event?: string
+  event_kind?: CrewEventKind
+}
+
+/** Fields a settings write may carry; merged server-side. */
+export interface CrewSettingsPatch {
+  claim_ttl_hours?: number
+  escalation_handback_days?: number
+  commit_trailer?: string
+}
+
+export interface CrewsResponse {
+  owner: string
+  repo: string
+  crews: Crew[]
+  settings: CrewSettings
+  counts: CrewCounts
+}
+
+/** Response to every single-crew write (create / update / pause / retire). */
+export interface CrewResponse {
+  crew: Crew
+}
+
+export interface CrewNamesResponse {
+  suggestions: string[]
+}
+
+export interface CrewDetailResponse {
+  crew: Crew
+  items: WorkItem[]
+  events: CrewEvent[]
+  /** Slot usage for THIS crew, against `max_open` / `max_escalated`. Served
+   * rather than counted client-side: the page renders a filtered slice of
+   * `items`, so a client tally would follow the filter. */
+  counts: { open: number; escalated: number }
+}
+
+/** `event` is null when the write carried no progress line. */
+export interface CrewWorkResponse {
+  item: WorkItem
+  event: CrewEvent | null
+}
+
+/** `injected` is false when the guidance was stored but the crew's session was
+ * not live to receive it — distinct from `ok`, which only says the write
+ * succeeded. */
+export interface CrewGuidanceResponse {
+  ok: boolean
+  injected: boolean
+}
+
+export interface CrewSettingsResponse {
+  settings: CrewSettings
+}
+
+/** One item waiting on a human, paired with the crew that raised it. */
+export interface CrewEscalationRow {
+  crew: Crew
+  item: WorkItem
+}
+
+export interface CrewEscalationsResponse {
+  escalations: CrewEscalationRow[]
+}
+
 export const issueRadarApi = {
   connect: async (url: string): Promise<ConnectResponse> => {
     const r = await fetch(`${API}/connect`, {
@@ -1411,6 +1729,159 @@ export const issueRadarApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...repoBody(ref), changes }),
     })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  // ── crews ──────────────────────────────────────────────────────────────────
+  //
+  // Record shapes and the phase classifications mirror `crew_store.py` — see the
+  // interface block above for which module owns each list.
+
+  /** Every non-retired crew in the repo, plus the repo-wide protocol settings and
+   * the header tallies. One request, because the crew list cannot be rendered
+   * without all three. */
+  crews: async (ref: RepoRef): Promise<CrewsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/crews?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Create a crew. A duplicate name is refused server-side (the name field is
+   * free text, so uniqueness cannot live in the suggestion chips). */
+  createCrew: async (ref: RepoRef, spec: CrewSpec): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crews`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), ...spec }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Unused names for the create dialog's chips. Server-side, because taken names
+   * include RETIRED crews' — which the crew list does not return. */
+  suggestCrewNames: async (ref: RepoRef): Promise<CrewNamesResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/crews/names?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** One crew's page payload: the record, its work items, its recent ledger
+   * lines, and its slot usage. */
+  crew: async (ref: RepoRef, id: string): Promise<CrewDetailResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), id })
+    const r = await fetch(`${API}/crew?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Merge a patch into one crew. A rename re-checks uniqueness but leaves
+   * `avatar_seed` alone, so the crew keeps its face. */
+  updateCrew: async (ref: RepoRef, id: string, patch: CrewPatch): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crew`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id, ...patch }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Retire a crew — it stops working, but its record, its NAME RESERVATION and
+   * its work log all survive. Deliberately not "delete": reusing the name would
+   * make the retired crew's old claim comments read as live claims. */
+  retireCrew: async (ref: RepoRef, id: string): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crew`, {
+      method: 'DELETE',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Upsert one work item AND append at most one ledger line, in one request —
+   * see `WorkItemPatch`. Refused (409) when a second item tries to enter an
+   * editing phase while another still holds the crew's worktree. */
+  recordCrewWork: async (
+    ref: RepoRef, id: string, number: number, patch: WorkItemPatch,
+  ): Promise<CrewWorkResponse> => {
+    const r = await fetch(`${API}/crew/work`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id, number, ...patch }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Pause or resume a crew. `reason` is stored on the record as
+   * `paused_reason`; pass it only when pausing. */
+  setCrewPaused: async (
+    ref: RepoRef, id: string, paused: boolean, reason?: string,
+  ): Promise<CrewResponse> => {
+    const r = await fetch(`${API}/crew/pause`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id, paused, reason: reason ?? '' }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Answer an escalation, or steer a crew on one issue. Resolving with
+   * `injected: false` means the guidance was RECORDED but the crew's session was
+   * not live to take it — the caller must report that, not treat it as delivered. */
+  sendCrewGuidance: async (
+    ref: RepoRef, id: string, number: number, text: string,
+  ): Promise<CrewGuidanceResponse> => {
+    const r = await fetch(`${API}/crew/guidance`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), id, number, text }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  getCrewSettings: async (ref: RepoRef): Promise<CrewSettingsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/crews/settings?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Merge a patch into the repo's protocol settings. A PATCH-style merge, not a
+   * whole-document replace, so this needs no revision guard: two tabs editing
+   * different fields cannot erase each other. */
+  putCrewSettings: async (
+    ref: RepoRef, patch: CrewSettingsPatch,
+  ): Promise<CrewSettingsResponse> => {
+    const r = await fetch(`${API}/crews/settings`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), ...patch }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Every item waiting on a human across ALL crews in the repo, each paired with
+   * the crew that raised it — Your Desk's queue. Server-side because it spans
+   * crews, so no single crew page holds the answer. */
+  crewEscalations: async (ref: RepoRef): Promise<CrewEscalationsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/crews/escalations?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },

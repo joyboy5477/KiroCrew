@@ -4684,10 +4684,36 @@ async def _run_chat(
                 # "rejected" is the correct reading: a cancelled turn never
                 # obtained consent.
                 outcome = "rejected"
+                # FIX 1: the window is resolved from DashboardState, not
+                # hardcoded. This call site used a literal 7200.0 and so could
+                # never reach the deny-fast background branch that
+                # state.request_approval already had — an app-owned worker with
+                # no human responder parked here for two hours and then denied
+                # anyway. See DashboardState.approval_timeout_for.
+                _approval_window = state.approval_timeout_for(slot)
+                _unattended_wait = slot.unattended
                 try:
-                    outcome = await asyncio.wait_for(fut, timeout=7200.0)
+                    outcome = await asyncio.wait_for(fut, timeout=_approval_window)
                 except asyncio.TimeoutError:
                     outcome = "rejected"
+                    if _unattended_wait:
+                        # Say so in the transcript. A silent denial makes an
+                        # unattended agent retry the same tool forever, because
+                        # nothing it can read explains the refusal.
+                        logger.warning(
+                            "Unattended approval expired after %.0fs; denying tool %r in slot %s",
+                            _approval_window,
+                            _safe_title,
+                            slot.key,
+                        )
+                        slot.append(
+                            "assistant",
+                            "\u26a0\ufe0f A tool needed approval and no one answered within "
+                            f"{int(_approval_window)}s, so it was declined. This session is "
+                            "running unattended — ask for the permission you need instead of "
+                            "retrying the same call.",
+                            "msg msg-a",
+                        )
                 finally:
                     slot._approval_futures.pop(str(event.request_id), None)
                     # Backstop: the future is now gone, so the permission
@@ -4697,8 +4723,9 @@ async def _run_chat(
                     # resolvers (HTTP slot-approve, Slack click) already mark it
                     # and record richer decisions like "trust"/"yolo", so only
                     # write when still pending. This is the sole marker for the
-                    # paths that resolve the future in-process: the 2h timeout
-                    # above and the Slack-delivery auto-reject branches.
+                    # paths that resolve the future in-process: the approval
+                    # timeout above (2h attended / 180s unattended) and the
+                    # Slack-delivery auto-reject branches.
                     _approved = outcome in ("approved", "approved_trust_reads")
                     if _mark_permission_resolved(
                         slot.messages,

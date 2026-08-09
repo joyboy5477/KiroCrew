@@ -19,6 +19,12 @@ vi.mock('../apps/issue-radar/components/SettingsSection', () => ({ default: () =
 const LeftRail = (await import('../apps/issue-radar/components/LeftRail')).default
 
 const openDashboard = vi.fn()
+const openCrews = vi.fn()
+const setCrewFilter = vi.fn()
+const cycleCrewSort = vi.fn()
+
+/** No crew needs anything — the rail's quiet state. */
+const CALM_COUNTS = { on_duty: 2, working: 1, needs_you: 0, paused: 0 }
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -30,6 +36,21 @@ beforeEach(() => {
     openIssues: vi.fn(),
     openPulls: vi.fn(),
     openSettings: vi.fn(),
+    // Crews slice: the rail reads the roster for its nav rows and the tallies for
+    // the needs-a-decision badge.
+    crews: [],
+    crewsLoading: false,
+    crewCounts: CALM_COUNTS,
+    crewView: { kind: 'desk' },
+    mainView: 'issues',
+    openCrews,
+    // The roster's filter and sort controls live here, mirroring how the issue and
+    // PR sections hold theirs while their list column holds the list.
+    crewFilter: 'all',
+    setCrewFilter,
+    crewSortKey: 'status',
+    crewSortDir: 'asc',
+    cycleCrewSort,
   }
 })
 
@@ -57,6 +78,90 @@ describe('LeftRail', () => {
     unmount()
     const second = render(<LeftRail width={340} />)
     expect((second.container.querySelector('aside') as HTMLElement).style.width).toBe('340px')
+  })
+})
+
+describe('LeftRail — crews section', () => {
+  // Queried by test id, not by copy: the `apps.issueRadar.views.crews.*` catalog
+  // keys are populated separately, so asserting on rendered English here would
+  // couple the rail's behaviour to the state of the translation files.
+  it('badges the section when crews are blocked on a decision', () => {
+    ctx.value = { ...ctx.value, crewCounts: { ...CALM_COUNTS, needs_you: 3 } }
+    render(<LeftRail />)
+    expect(screen.getByTestId('crews-needs-you').textContent).toBe('3')
+  })
+
+  it('shows no badge when nothing needs a decision', () => {
+    render(<LeftRail />)
+    expect(screen.queryByTestId('crews-needs-you')).toBeNull()
+  })
+
+  it('keeps the badge in the section HEADER, so a collapsed section still shows it', async () => {
+    // The whole point of the count: a crew stopped on a human decision has to be
+    // visible from any page. In the body it would vanish the moment another
+    // section is opened — which is the rail's resting state four times out of five.
+    ctx.value = { ...ctx.value, expanded: 'filters', crewCounts: { ...CALM_COUNTS, needs_you: 1 } }
+    render(<LeftRail />)
+    const badge = screen.getByTestId('crews-needs-you')
+    const header = badge.closest('button')
+    expect(header).not.toBeNull()
+    // Clicking that header navigates with NO argument, so the crews page you were
+    // last on is restored rather than reset to Your Desk.
+    await userEvent.click(header as HTMLButtonElement)
+    expect(openCrews).toHaveBeenCalledWith()
+  })
+
+  it('does not repeat the roster — that list, with its status, is column 2', () => {
+    ctx.value = {
+      ...ctx.value,
+      expanded: 'crews',
+      mainView: 'crews',
+      crews: [
+        { id: 'c1', name: 'Andromeda', enabled: true, retired_at: null, labels: [], status: 'working' },
+        { id: 'c2', name: 'Whirlpool', enabled: true, retired_at: null, labels: [], status: 'needs_you' },
+      ],
+      crewCounts: { on_duty: 2, working: 1, needs_you: 1, paused: 0 },
+    }
+    render(<LeftRail />)
+    // The section is a DESTINATION, not a second copy of the roster: column 2
+    // already lists every crew AND carries each one's status dot and current
+    // work item, so repeating the names here would duplicate one list and the
+    // duplicate would be the copy without the state. The issues view sets the
+    // precedent — its rail holds filters, its list column holds the issues.
+    expect(screen.queryByText('Andromeda')).toBeNull()
+    expect(screen.queryByText('Whirlpool')).toBeNull()
+    // And no status word in column 1 either (the badge's count is the header's).
+    expect(screen.queryByText('needs you')).toBeNull()
+    expect(screen.queryByText('working')).toBeNull()
+  })
+
+
+  it('carries the roster filters, with the server tally on each', async () => {
+    // These moved out of column 2 so the three list columns are consistent: the
+    // rail narrows a list, the column shows it. The counts are the SERVER's — the
+    // roster payload has no per-crew work items to derive them from.
+    ctx.value = {
+      ...ctx.value,
+      expanded: 'crews',
+      crewCounts: { on_duty: 6, working: 3, needs_you: 2, paused: 1 },
+    }
+    render(<LeftRail />)
+    expect(screen.getByTestId('crew-filter-all').getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByTestId('crew-filter-needs_you').textContent).toContain('2')
+
+    await userEvent.click(screen.getByTestId('crew-filter-paused'))
+    expect(setCrewFilter).toHaveBeenCalledWith('paused')
+    // Navigates too, so picking a filter from a rail left open on another view is
+    // not silent.
+    expect(openCrews).toHaveBeenCalled()
+  })
+
+  it('cycles the roster sort from the rail', async () => {
+    ctx.value = { ...ctx.value, expanded: 'crews' }
+    render(<LeftRail />)
+    expect(screen.getByTestId('crew-sort-status').getAttribute('aria-pressed')).toBe('true')
+    await userEvent.click(screen.getByTestId('crew-sort-name'))
+    expect(cycleCrewSort).toHaveBeenCalledWith('name')
   })
 })
 

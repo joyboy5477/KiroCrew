@@ -218,6 +218,13 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 error="app does not own this slot",
             )
             return web.json_response({"error": "not found"}, status=404)
+    else:
+        # FIX 1: a dashboard user (no app token) typed into this slot, so a
+        # human demonstrably has it open. That restores the full 2h approval
+        # window even on an app-owned tab — the deny-fast window is for slots
+        # nobody is watching. Only a caller with an EMPTY request_app reaches
+        # here, so an app cannot forge attendance for its own worker.
+        slot._human_seen = True
 
     if slot.agent not in (None, ""):
         # Slot already has an agent — only reject explicit mismatches (non-empty different agent).
@@ -566,7 +573,12 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     except Exception:
         logger.debug("on_user_message observer raised; ignoring", exc_info=True)
 
-    task = spawn_guarded_turn(state, slot, _run_chat(state, slot, message))
+    # FIX 2: an unattended app-owned turn runs under the background concurrency
+    # cap; run_background_turn passes an attended slot straight through, so the
+    # interactive path is unchanged (no semaphore is even created).
+    task = spawn_guarded_turn(
+        state, slot, state.run_background_turn(slot, _run_chat(state, slot, message))
+    )
     slot.task = task
     slot._recovery_retrigger_count = 0
     state.push_slots_update()
@@ -1932,6 +1944,25 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         state._restricted_keys.discard(f"dashboard:{name}")
     # Kill the per-tab session to free resources
     await state.sessions.remove(_history_key_for(name))
+    # FIX 3: retire this slot's auto-nudge loop HERE, at the moment the user
+    # dismissed the tab. "Respect the close" used to be an emergent property of
+    # the fire path's rehydrate miss — and that is precisely the miss the fire
+    # path must now adopt through (see _fire_dashboard_nudge's adopt_closed), or
+    # idle archival kills loops terminally. Making the user's ✕ the explicit,
+    # immediate retirement keeps the rule intact without relying on a cache miss
+    # to enforce it, and stops a dismissed tab being resurrected by its own loop.
+    try:
+        from kiro_crew.autonudge import (
+            get_instance as _autonudge_get,  # circular: autonudge -> dashboard.chat -> chat_handlers
+        )
+
+        _svc = _autonudge_get()
+        if _svc is not None:
+            _lp = _svc.get_by_slot(name)
+            if _lp is not None:
+                await _svc.remove(_lp.id)
+    except Exception:
+        logger.warning("autonudge loop removal on slot close failed", exc_info=True)
     _sync_dashboard_slots(state)
     state.push_slots_update()
     state.push_refresh("history")
@@ -1958,11 +1989,43 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     dry_run = body.get("dry_run", False)
     request_app = request.get("app", "")
     cutoff = time.time() - max_days * 86400
+    # FIX 3: slots owning an ARMED auto-nudge loop are exempt from idle archival.
+    # Archiving one marked it closed, and the nudge fire path then could not
+    # reach it and REMOVED the loop — terminally. An unattended worker is idle
+    # by nature between cycles (a 6h CI wait looks exactly like abandonment), so
+    # the 3-day idle heuristic reliably shot the longest-running loops. Resolved
+    # once, outside the per-slot loop, so a large registry costs one pass.
+    _looped: set[str] = set()
+    try:
+        from kiro_crew.autonudge import (
+            get_instance as _autonudge_get,  # circular: autonudge -> dashboard.chat -> chat_handlers
+        )
+
+        _svc = _autonudge_get()
+        if _svc is not None:
+            for _lp in _svc.list_all():
+                if not _lp.active:
+                    continue
+                _looped.add(_lp.slot_key)
+                # A channel-born loop is bound under its channel session key
+                # (slack:<ts>) while its tab is named with the folded form
+                # (slack_<ts>) — match both or the exemption misses the tab.
+                _looped.add(_normalize_slot_key(_lp.slot_key))
+    except Exception:
+        # Fail CLOSED for the loops: if the registry cannot be read we do not
+        # know which slots are protected, so archive nothing this pass rather
+        # than risk destroying a loop. Cleanup is a convenience; the loop is not.
+        logger.warning("Cleanup: auto-nudge registry unreadable; skipping this pass", exc_info=True)
+        return web.json_response(
+            {"ok": True, "archived": 0, "keys": [], "failed": [], "skipped": "autonudge_unknown"}
+        )
     stale_keys: list[str] = []
     active_is_stale = False
     for name in list(state._slots):
         slot = state._slots.get(name)
         if slot is None or slot.pinned:
+            continue
+        if name in _looped:
             continue
         # App Kit ownership isolation: app callers can only archive
         # their own slots. Dashboard users (empty request_app) pass

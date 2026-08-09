@@ -9,17 +9,23 @@
 //
 // In 'dashboard' main view the list+detail split is replaced by a full-width
 // dashboard page (Overview / Tagging), chosen from the
-// registry. 'settings' shows the Settings page in the same area. The rail stays
+// registry. 'settings' shows the Settings page in the same area. 'crews' keeps
+// the two-column shape with a different pair: the crew roster in the list column
+// and either Your Desk or one crew's page beside it — which is why it is a
+// MainView and not a dashboard tab. The rail stays
 // visible in every mode. All shared state comes from useIssueRadar(); this file
 // owns only presentational layout (column resize).
+import { useState } from 'react'
 import { CircleDot, GitPullRequest, FilterX } from 'lucide-react'
 import { useIssueRadar } from './context'
+import type { Crew } from './api'
 import { Btn } from '../../components/ui'
 import {
-  loadListWidth, LIST_WIDTH_KEY, MIN_LIST_WIDTH, MAX_LIST_WIDTH,
+  loadListWidth, LIST_WIDTH_KEY, MIN_LIST_WIDTH, MAX_LIST_WIDTH, DEFAULT_LIST_WIDTH,
   loadRailWidth, loadRailCollapsed, RAIL_WIDTH_KEY, RAIL_COLLAPSED_KEY,
   MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, COLLAPSED_RAIL_WIDTH,
 } from './lib/format'
+import { loadColumnWidth } from '../../lib/columnWidth'
 import { useColumnResize, type CollapseConfig } from '../../hooks/useColumnResize'
 import LeftRail from './components/LeftRail'
 import ResizeHandle from '../../components/ResizeHandle'
@@ -27,6 +33,10 @@ import IssueList from './components/IssueList'
 import IssueDetail from './components/IssueDetail'
 import PrList from './components/PrList'
 import PrDetail from './components/PrDetail'
+import CrewList from './components/CrewList'
+import CrewEditor from './components/CrewEditor'
+import CrewDesk from './views/CrewDesk'
+import CrewPageView from './views/CrewPageView'
 import SettingsView from './views/SettingsView'
 import { dashboardComponent } from './views/registry'
 import { providerTerms } from './lib/links'
@@ -35,11 +45,25 @@ import { i18nT } from '../../i18n/t'
 // Module-level so the hook's memoised resolver isn't invalidated every render.
 const RAIL_COLLAPSE: CollapseConfig = { width: COLLAPSED_RAIL_WIDTH, storageKey: RAIL_COLLAPSED_KEY }
 
+/** The crew roster column's own persisted width.
+ *
+ * Separate from `LIST_WIDTH_KEY` on purpose: the issue and PR lists share a key
+ * because they hold the same shape of content and are never both on screen, while
+ * the roster is a different column — its rows carry an avatar and a status line,
+ * so a width that suits one is not the width that suits the other. Sharing the key
+ * would also mean dragging one silently resized the other two. Bounds are reused
+ * (240–600px), which is the range every list column in this app lives in. */
+const CREW_LIST_WIDTH_KEY = 'kc:issue-radar:crew-list-width'
+const loadCrewListWidth = () => loadColumnWidth(
+  CREW_LIST_WIDTH_KEY, MIN_LIST_WIDTH, MAX_LIST_WIDTH, DEFAULT_LIST_WIDTH,
+)
+
 export default function Workspace() {
   const {
     mainView, dashboardTab, activeIssue, activePull, active,
     selectedIssue, anyFilterActive, clearFilters,
     selectedPull, anyPrFilterActive, clearPrFilters,
+    crewView,
   } = useIssueRadar()
   // A selection resolved from the FILTERED list has no fallback (see context's
   // activeIssue/activePull), so an active filter that excludes the selected item
@@ -58,6 +82,14 @@ export default function Workspace() {
     RAIL_WIDTH_KEY, loadRailWidth, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, RAIL_COLLAPSE, loadRailCollapsed,
   )
   const list = useColumnResize(LIST_WIDTH_KEY, loadListWidth, MIN_LIST_WIDTH, MAX_LIST_WIDTH)
+  const crewList = useColumnResize(CREW_LIST_WIDTH_KEY, loadCrewListWidth, MIN_LIST_WIDTH, MAX_LIST_WIDTH)
+
+  // The crew create/edit dialog's target. `null` = closed; `{crew: null}` = create;
+  // `{crew}` = edit that record. A wrapper object, not a bare `Crew | null`, so
+  // "closed" and "open on a new crew" are distinguishable — with one nullable
+  // field they collapse into the same value and the dialog can never be closed
+  // after a create. Transient by design: a restored-open dialog is not a page.
+  const [crewEditor, setCrewEditor] = useState<{ crew: Crew | null } | null>(null)
 
   const DashboardView = dashboardComponent(dashboardTab)
 
@@ -149,6 +181,43 @@ export default function Workspace() {
                   </div>
                 )}
           </main>
+        </>
+      ) : mainView === 'crews' ? (
+        <>
+          <section style={{ width: crewList.width }} className="flex-shrink-0 min-h-0">
+            <CrewList />
+          </section>
+
+          {/* Drag handle — resize the crew-list column. Its own width key (see
+              CREW_LIST_WIDTH_KEY): sharing LIST_WIDTH_KEY would make dragging the
+              roster narrower also narrow the issue and PR lists, which are
+              different columns holding different content. */}
+          <ResizeHandle
+            handleProps={crewList.handleProps}
+            label={i18nT('apps.issueRadar.workspace.resize_list')}
+            onNudge={crewList.nudge}
+            value={crewList.width}
+            min={MIN_LIST_WIDTH}
+            max={MAX_LIST_WIDTH}
+          />
+
+          <main className="flex-1 min-w-0 min-h-0 overflow-y-auto">
+            {crewView.kind === 'desk'
+              ? <CrewDesk onCreate={() => setCrewEditor({ crew: null })} />
+              : <CrewPageView crewId={crewView.id} onEdit={(crew) => setCrewEditor({ crew })} />}
+          </main>
+
+          {/* The create/edit dialog is mounted HERE rather than inside either
+              column, because both raise it: Your Desk's "New Crew" creates, and
+              the crew page's Edit opens the same form on a record. One owner also
+              means one open dialog — two mounts would let a create and an edit
+              sheet stack. Rendered only in this main view, so it cannot be opened
+              from a page that has no crew context. */}
+          <CrewEditor
+            open={crewEditor !== null}
+            onClose={() => setCrewEditor(null)}
+            crew={crewEditor?.crew ?? null}
+          />
         </>
       ) : (
         <main className="flex-1 min-w-0 overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
